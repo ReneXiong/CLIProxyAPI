@@ -1,0 +1,202 @@
+name: Rebase PR 5332
+
+on:
+  push:
+    branches:
+      - tmp/rebase-5332
+
+permissions:
+  contents: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Rebuild PR on current upstream dev
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "ReneXiong"
+          git config user.email "11025160+ReneXiong@users.noreply.github.com"
+          git remote add upstream https://github.com/router-for-me/CLIProxyAPI.git 2>/dev/null || true
+          git fetch upstream dev
+          git fetch origin feat/antigravity-web-search-override
+          git checkout -B rebase-5332 upstream/dev
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one match, got {count}")
+              p.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              "internal/config/config_types.go",
+              '''\tSensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`\n\n\t// ConnectionPool configures upstream HTTP connection pooling behavior for Antigravity.''',
+              '''\tSensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`\n\n\t// WebSearchModels marks the listed Antigravity model IDs as web search capable.\n\t// This is an operator override for models accepted by googleSearch but omitted\n\t// from fetchAvailableModels.webSearchModelIds. Entries are matched\n\t// case-insensitively against the bare upstream model ID.\n\tWebSearchModels []string `yaml:"web-search-models,omitempty" json:"web-search-models,omitempty"`\n\n\t// ConnectionPool configures upstream HTTP connection pooling behavior for Antigravity.'''
+          )
+
+          replace_once(
+              "config.example.yaml",
+              '''#     - "API"\n#     - "proxy"\n#   connection-pool:''',
+              '''#     - "API"\n#     - "proxy"\n#   web-search-models:           # optional: treat these Antigravity models as web search capable\n#     - "gemini-3.7-flash-high"  # use when upstream accepts googleSearch but omits the model from webSearchModelIds\n#   connection-pool:'''
+          )
+
+          replace_once(
+              "internal/watcher/diff/config_diff.go",
+              '''\tif !reflect.DeepEqual(oldCfg.Antigravity.SensitiveWords, newCfg.Antigravity.SensitiveWords) {\n\t\tchanges = append(changes, fmt.Sprintf("antigravity.sensitive-words: %d -> %d", len(oldCfg.Antigravity.SensitiveWords), len(newCfg.Antigravity.SensitiveWords)))\n\t}\n\tif !reflect.DeepEqual(oldCfg.Devin.SensitiveWords, newCfg.Devin.SensitiveWords) {''',
+              '''\tif !reflect.DeepEqual(oldCfg.Antigravity.SensitiveWords, newCfg.Antigravity.SensitiveWords) {\n\t\tchanges = append(changes, fmt.Sprintf("antigravity.sensitive-words: %d -> %d", len(oldCfg.Antigravity.SensitiveWords), len(newCfg.Antigravity.SensitiveWords)))\n\t}\n\tif !reflect.DeepEqual(oldCfg.Antigravity.WebSearchModels, newCfg.Antigravity.WebSearchModels) {\n\t\tchanges = append(changes, fmt.Sprintf("antigravity.web-search-models: %d -> %d", len(oldCfg.Antigravity.WebSearchModels), len(newCfg.Antigravity.WebSearchModels)))\n\t}\n\tif !reflect.DeepEqual(oldCfg.Devin.SensitiveWords, newCfg.Devin.SensitiveWords) {'''
+          )
+
+          replace_once(
+              "sdk/cliproxy/antigravity_models.go",
+              '''\t\thints := s.fetchAntigravityModelCapabilityHintsForAuth(probeCtx, authClone)\n\t\tif len(hints.WebSearchModelIDs) == 0 {''',
+              '''\t\thints := s.antigravityModelCapabilityHints(probeCtx, authClone)\n\t\tif len(hints.WebSearchModelIDs) == 0 {'''
+          )
+
+          helper = r'''
+// antigravityModelCapabilityHints resolves Antigravity capability hints by
+// combining upstream-advertised capabilities with operator-configured web
+// search overrides. Overrides still apply when the remote catalog is empty or
+// unavailable.
+func (s *Service) antigravityModelCapabilityHints(ctx context.Context, auth *coreauth.Auth) antigravityModelCapabilityHints {
+\thints := s.fetchAntigravityModelCapabilityHintsForAuth(ctx, auth)
+\toverrides := s.antigravityWebSearchModelOverrides()
+\tif len(overrides) == 0 {
+\t\treturn hints
+\t}
+\tif hints.WebSearchModelIDs == nil {
+\t\thints.WebSearchModelIDs = make(map[string]struct{}, len(overrides))
+\t}
+\tfor modelID := range overrides {
+\t\thints.WebSearchModelIDs[modelID] = struct{}{}
+\t}
+\treturn hints
+}
+
+// antigravityWebSearchModelOverrides returns normalized configured model IDs.
+func (s *Service) antigravityWebSearchModelOverrides() map[string]struct{} {
+\tif s == nil {
+\t\treturn nil
+\t}
+\ts.cfgMu.RLock()
+\tdefer s.cfgMu.RUnlock()
+\tif s.cfg == nil || len(s.cfg.Antigravity.WebSearchModels) == 0 {
+\t\treturn nil
+\t}
+\toverrides := make(map[string]struct{}, len(s.cfg.Antigravity.WebSearchModels))
+\tfor _, modelID := range s.cfg.Antigravity.WebSearchModels {
+\t\tif modelID = normalizeAntigravityFetchedModelID(modelID); modelID != "" {
+\t\t\toverrides[modelID] = struct{}{}
+\t\t}
+\t}
+\tif len(overrides) == 0 {
+\t\treturn nil
+\t}
+\treturn overrides
+}
+
+'''
+          p = Path("sdk/cliproxy/antigravity_models.go")
+          text = p.read_text()
+          marker = "func (s *Service) probeAntigravityModelCapabilityHints("
+          if text.count(marker) != 1:
+              raise SystemExit("antigravity_models.go: probe marker not unique")
+          p.write_text(text.replace(marker, helper + marker, 1))
+          PY
+
+          cat > sdk/cliproxy/antigravity_web_search_override_test.go <<'EOF'
+          package cliproxy
+
+          import (
+          	"context"
+          	"testing"
+
+          	internalregistry "github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+          	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+          	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+          )
+
+          func antigravityOverrideAuthWithoutAccessToken() *coreauth.Auth {
+          	return &coreauth.Auth{ID: "auth-antigravity-override", Provider: "antigravity"}
+          }
+
+          func serviceWithWebSearchModels(models ...string) *Service {
+          	cfg := &config.Config{}
+          	cfg.Antigravity.WebSearchModels = models
+          	return &Service{cfg: cfg}
+          }
+
+          func TestAntigravityWebSearchModelOverridesNormalizesEntries(t *testing.T) {
+          	service := serviceWithWebSearchModels("Gemini-3.7-Flash-High", "  gemini-3-flash  ", "", "   ")
+          	overrides := service.antigravityWebSearchModelOverrides()
+          	if len(overrides) != 2 {
+          		t.Fatalf("overrides = %v, want 2 normalized entries", overrides)
+          	}
+          	for _, want := range []string{"gemini-3.7-flash-high", "gemini-3-flash"} {
+          		if _, ok := overrides[want]; !ok {
+          			t.Fatalf("overrides missing %q: %v", want, overrides)
+          		}
+          	}
+          }
+
+          func TestAntigravityWebSearchModelOverridesEmptyWithoutConfig(t *testing.T) {
+          	if got := (&Service{cfg: &config.Config{}}).antigravityWebSearchModelOverrides(); got != nil {
+          		t.Fatalf("unconfigured overrides = %v, want nil", got)
+          	}
+          	if got := (&Service{}).antigravityWebSearchModelOverrides(); got != nil {
+          		t.Fatalf("nil-config overrides = %v, want nil", got)
+          	}
+          	if got := (*Service)(nil).antigravityWebSearchModelOverrides(); got != nil {
+          		t.Fatalf("nil-service overrides = %v, want nil", got)
+          	}
+          }
+
+          func TestAntigravityModelCapabilityHintsMergesOverridesWithoutUpstreamHints(t *testing.T) {
+          	service := serviceWithWebSearchModels("gemini-3.7-flash-high")
+          	hints := service.antigravityModelCapabilityHints(context.Background(), antigravityOverrideAuthWithoutAccessToken())
+          	if _, ok := hints.WebSearchModelIDs["gemini-3.7-flash-high"]; !ok {
+          		t.Fatalf("hints = %v, want configured override present", hints.WebSearchModelIDs)
+          	}
+          }
+
+          func TestApplyAntigravityFetchedModelCapabilitiesUnionsFetchedAndOverridden(t *testing.T) {
+          	service := serviceWithWebSearchModels("gemini-override-only")
+          	hints := service.antigravityModelCapabilityHints(context.Background(), antigravityOverrideAuthWithoutAccessToken())
+          	hints.WebSearchModelIDs["gemini-fetched-only"] = struct{}{}
+          	models := applyAntigravityFetchedModelCapabilities([]*internalregistry.ModelInfo{
+          		{ID: "gemini-override-only"},
+          		{ID: "gemini-fetched-only"},
+          		{ID: "gemini-untouched"},
+          	}, hints)
+          	got := make(map[string]bool, len(models))
+          	for _, model := range models {
+          		got[model.ID] = model.SupportsWebSearch
+          	}
+          	for _, id := range []string{"gemini-override-only", "gemini-fetched-only"} {
+          		if !got[id] {
+          			t.Fatalf("%s SupportsWebSearch = false, want true: %v", id, got)
+          		}
+          	}
+          	if got["gemini-untouched"] {
+          		t.Fatalf("gemini-untouched SupportsWebSearch = true, want false: %v", got)
+          	}
+          }
+          EOF
+
+          gofmt -w internal/config/config_types.go internal/watcher/diff/config_diff.go sdk/cliproxy/antigravity_models.go sdk/cliproxy/antigravity_web_search_override_test.go
+          git diff --check
+          go test ./sdk/cliproxy ./internal/config/... ./internal/watcher/... ./internal/registry/...
+          go build -o /tmp/cli-proxy-api ./cmd/server
+
+          git add config.example.yaml internal/config/config_types.go internal/watcher/diff/config_diff.go sdk/cliproxy/antigravity_models.go sdk/cliproxy/antigravity_web_search_override_test.go
+          git commit -m "feat(antigravity): allow configuring web search capable models" -m "Allow operators to mark Antigravity models as web-search capable when fetchAvailableModels.webSearchModelIds omits a model that still accepts native googleSearch. Merge configured overrides with upstream hints, including when the remote catalog is unavailable."
+          git push origin HEAD:feat/antigravity-web-search-override --force-with-lease=refs/heads/feat/antigravity-web-search-override:a5ef81acd51e10f9b1f8f6ac3f203f8b70d6a9bf
